@@ -1,3 +1,5 @@
+
+
 # python3 prepare_obs.py 1233.txt
 from __future__ import annotations
 import re
@@ -5,23 +7,16 @@ import math
 import sys
 import warnings
 from typing import Dict, Tuple, Optional
-
-import requests
 import pandas as pd
-import numpy as np
-from astropy.time import Time
 from astropy.utils import iers
+from astropy.coordinates import EarthLocation, GCRS
+from astropy.time import Time
+import astropy.units as u
+import numpy as np
 
 iers.conf.auto_download = False
 
-EARTH_EQUATORIAL_RADIUS_KM = 6378.140
-
-# URL для ObsCodesF
-MPC_OBSCODES_URLS = [
-    "https://www.minorplanetcenter.net/iau/lists/ObsCodesF.html",
-    "https://www.projectpluto.com/neocp2/ObsCodesF.html"
-]
-
+EARTH_RADIUS_KM = 6371.0 
 
 import warnings
 try:
@@ -30,50 +25,78 @@ try:
 except Exception:
     pass
 
-
-def fetch_obs_codes_html() -> str:
-    """ Скачать HTML-страницу с ObsCodesF """
-    last_err = None
-    for url in MPC_OBSCODES_URLS:
-        try:
-            r = requests.get(url, timeout=12)
-            r.raise_for_status()
-            return r.text
-        except Exception as e:
-            last_err = e
-    raise RuntimeError(f"Не удалось загрузить список ObsCodesF. Ошибка: {last_err}")
-
-
-def parse_obs_codes_from_html(html_text: str) -> Dict[str, Tuple[float, float, float, str]]:
+def read_observatories_from_file() -> Dict[str, Tuple[float, float, float, str]]:
     """
-    Парсит HTML-страницу ObsCodesF и возвращает словарь:
-        code -> (longitude_deg, rho_cos, rho_sin, name)
-    rho_cos и rho_sin в единицах земных экваториальных радиусов (как на странице MPC).
+    Читает файл obscodes.txt с переменной шириной колонок
+    Формат: code longitude_hours cos sin place
     """
-    lines = html_text.splitlines()
-    out: Dict[str, Tuple[float, float, float, str]] = {}
-    # Регекс для строк данных: код, longitude, cos, sin, name
-    data_re = re.compile(r'^\s*([0-9A-Z]{3})\s+([\-0-9\.]+)\s+([\-0-9\.]+)\s+([+\-]?[0-9\.]+)\s+(.*)$')
-    for L in lines:
-        m = data_re.match(L)
-        if m:
-            code = m.group(1).strip().upper()
-            try:
-                lon = float(m.group(2))
-                rho_cos = float(m.group(3))
-                rho_sin = float(m.group(4))
-            except Exception:
+    obs_map = {}
+    with open("obscodes.txt", 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
                 continue
-            name = m.group(5).strip()
-            out[code] = (lon, rho_cos, rho_sin, name)
-    if not out:
-        raise RuntimeError("Не найдено данных обсерваторий в загруженном HTML.")
-    return out
+                
+            # Разбиваем строку по пробелам (любое количество)
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+                
+            code = parts[0]
+            
+            try:
+                # longitude в часах, нужно перевести в градусы
+                longitude_hours = float(parts[1])
+                longitude_deg = longitude_hours * 15.0  # часов → градусов
+                
+                cos_val = float(parts[2])
+                sin_val = float(parts[3])
+                
+                # Название обсерватории (может содержать пробелы)
+                name = ' '.join(parts[4:])
+                
+                obs_map[code] = (
+                    longitude_deg,  # В ГРАДУСАХ для obs2cart
+                    cos_val,
+                    sin_val,
+                    name
+                )
+                
+            except (ValueError, IndexError) as e:
+                print(f"Ошибка парсинга строки: {line}")
+                print(f"Ошибка: {e}")
+                continue
+    
+    print(f"Загружено кодов обсерваторий: {len(obs_map)}")
+    for code, (lon, cos, sin, name) in list(obs_map.items())[:5]:
+        print(f"  {code}: lon={lon:.4f}°, cos={cos:.5f}, sin={sin:.5f}, name={name}")
+    
+    return obs_map
+
+def obs2cart(obs_time: Time, lon_deg: float, cos_phi: float, sin_phi: float) -> np.ndarray:
+    """
+    Перевод координат обсерватории в GCRS.
+    """
+    # Вычисляем широту из sin/cos
+    lat_rad = np.arctan2(sin_phi, cos_phi)
+    
+    # Создаём объект EarthLocation
+    loc = EarthLocation(lat=lat_rad*u.rad, lon=lon_deg*u.deg, height=0*u.m)
+    
+    # Получаем координаты в GCRS на момент obs_time
+    gcrs = loc.get_gcrs(obs_time)
+    
+    # Конвертируем из метров в километры
+    x_km = gcrs.cartesian.x.value / 1000.0
+    y_km = gcrs.cartesian.y.value / 1000.0
+    z_km = gcrs.cartesian.z.value / 1000.0
+    
+    return np.array([x_km, y_km, z_km])
 
 
 # ----------------- Регулярные выражения для парсинга -----------------
 # дата: возможный префикс буквы, затем 4-цифр.год, месяц, день.фракция 
-date_re = re.compile(r'[A-Za-z]?((?:18|19|20)\d{2})\s+(\d{1,2})\s+(\d{1,2}\.\d+)', re.IGNORECASE)
+date_re = re.compile(r'([A-Za-z]?\d{4})\s+(\d{1,2})\s+(\d{1,2}\.\d+)', re.IGNORECASE)
 
 # RA: hh mm ss.s  или компактный  hhmmss.s
 ra_re = re.compile(r'(\d{1,2})\s+(\d{1,2}(?:\.\d+)?)\s+(\d{1,2}(?:\.\d+)?)')
@@ -84,25 +107,31 @@ dec_re = re.compile(r'([+\-]\d{1,2})\s+(\d{1,2}(?:\.\d+)?)\s+(\d{1,2}(?:\.\d+)?)
 dec_short_re = re.compile(r'([+\-]\d{1,2})\s+(\d{1,2}(?:\.\d+)?)')
 dec_compact_re = re.compile(r'([+\-]\d{6,7}(?:\.\d+)?)')
 
-# alt-vector: три подряд signed числа, допускаем пробел после знака: "+ 3440.2430  + 1889.8250  + 4667.1340"
-vector_re = re.compile(r'([+\-]\s*\d{1,7}(?:\.\d+)?)\s+([+\-]\s*\d{1,7}(?:\.\d+)?)\s+([+\-]\s*\d{1,7}(?:\.\d+)?)')
-
 
 def parse_time_from_line(line: str) -> Optional[Time]:
-    """Извлекает дату/время (UTC) из строки; возвращает astropy.Time или None."""
-    m = date_re.search(line)
+    """Извлекает дату/время из строки"""
+    # Новое регулярное выражение для формата "A1927 10 03.92944"
+    pattern = r'([A-Za-z]?\d{4})\s+(\d{1,2})\s+(\d{1,2}\.\d+)'
+    m = re.search(pattern, line)
+    
     if not m:
         return None
-    year_full = int(m.group(1))
+    
+    year_str = m.group(1)
+    # Удаляем букву префикса, если есть
+    year_full = int(re.sub(r'[A-Za-z]', '', year_str))
     month = int(m.group(2))
     dayf = float(m.group(3))
+    
     day_int = int(math.floor(dayf))
     frac = dayf - day_int
     seconds = frac * 86400.0
     hh = int(seconds // 3600)
     mm = int((seconds % 3600) // 60)
     ss = (seconds % 60)
+    
     iso = f"{year_full:04d}-{month:02d}-{day_int:02d}T{hh:02d}:{mm:02d}:{ss:09.6f}"
+    
     try:
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', category=Warning)
@@ -113,119 +142,141 @@ def parse_time_from_line(line: str) -> Optional[Time]:
 
 
 def parse_ra_from_line(line: str) -> Optional[float]:
-    """Ищет RA; возвращает градусы (J2000) или None."""
-    m = ra_re.search(line)
+    """Парсинг RA с учетом различных форматов."""
+    # Формат 1: часы минуты секунды (разделены пробелами)
+    pattern1 = r'(\d{1,2})\s+(\d{1,2})\s+(\d{1,2}(?:\.\d+)?)'
+    # Формат 2: часы минуты (без секунд)
+    pattern2 = r'(\d{1,2})\s+(\d{1,2}(?:\.\d+)?)(?:\s+|$)'
+    
+    # Ищем после даты
+    date_match = date_re.search(line)
+    if not date_match:
+        return None
+    
+    # Берем часть строки после даты
+    date_end = date_match.end()
+    rest = line[date_end:]
+    
+    # Пробуем первый формат
+    m = re.search(pattern1, rest)
     if m:
-        h = float(m.group(1)); mn = float(m.group(2)); sec = float(m.group(3))
-        return (h + mn / 60.0 + sec / 3600.0) * 15.0
-    m2 = ra_compact_re.search(line)
-    if m2:
-        s = m2.group(1)
-        part = s.split('.')[0]
-        if len(part) >= 6:
-            hh = float(part[0:2]); mm = float(part[2:4]); ss = float(part[4:]) if len(part) > 4 else 0.0
-            return (hh + mm / 60.0 + ss / 3600.0) * 15.0
+        h = float(m.group(1))
+        mn = float(m.group(2))
+        sec = float(m.group(3)) if m.group(3) else 0.0
+        return (h + mn/60.0 + sec/3600.0) * 15.0
+    
+    # Пробуем второй формат
+    m = re.search(pattern2, rest)
+    if m:
+        h = float(m.group(1))
+        mn = float(m.group(2))
+        return (h + mn/60.0) * 15.0
+    
     return None
 
 
 def parse_dec_from_line(line: str) -> Optional[float]:
-    """Ищет Declination; возвращает градусы (signed) или None."""
-    m = dec_re.search(line)
+    """Парсинг Dec с учетом различных форматов."""
+    # Формат 1: ±градусы минуты секунды
+    pattern1 = r'([+\-]\d{1,2})\s+(\d{1,2})\s+(\d{1,2}(?:\.\d+)?)'
+    # Формат 2: ±градусы минуты
+    pattern2 = r'([+\-]\d{1,2})\s+(\d{1,2}(?:\.\d+)?)(?:\s+|$)'
+    
+    date_match = date_re.search(line)
+    if not date_match:
+        return None
+    
+    date_end = date_match.end()
+    rest = line[date_end:]
+    
+    # Сначала найдем RA, чтобы знать где начинается Dec
+    ra_match = re.search(r'(\d{1,2})\s+(\d{1,2}(?:\.\d+)?)(?:\s+(\d{1,2}(?:\.\d+)?))?', rest)
+    if not ra_match:
+        return None
+    
+    # Берем часть после RA
+    ra_end = ra_match.end()
+    dec_part = rest[ra_end:]
+    
+    # Ищем Dec
+    m = re.search(pattern1, dec_part)
     if m:
         sgn = -1 if m.group(1).startswith('-') else 1
-        deg_abs = abs(float(re.sub(r'[+\-]', '', m.group(1))))
-        arcmin = float(m.group(2)); arcsec = float(m.group(3))
-        return sgn * (deg_abs + arcmin / 60.0 + arcsec / 3600.0)
-    m2 = dec_short_re.search(line)
-    if m2:
-        sgn = -1 if m2.group(1).startswith('-') else 1
-        deg_abs = abs(float(re.sub(r'[+\-]', '', m2.group(1))))
-        arcmin = float(m2.group(2))
-        return sgn * (deg_abs + arcmin / 60.0)
-    m3 = dec_compact_re.search(line)
-    if m3:
-        s = m3.group(1); sgn = -1 if s.startswith('-') else 1; s2 = s[1:]
-        if len(s2) >= 6:
-            d = float(s2[0:2]); m_ = float(s2[2:4]); sec = float(s2[4:]) if len(s2) > 4 else 0.0
-            return sgn * (d + m_ / 60.0 + sec / 3600.0)
+        deg = abs(float(re.sub(r'[+\-]', '', m.group(1))))
+        arcmin = float(m.group(2))
+        arcsec = float(m.group(3)) if m.group(3) else 0.0
+        return sgn * (deg + arcmin/60.0 + arcsec/3600.0)
+    
+    m = re.search(pattern2, dec_part)
+    if m:
+        sgn = -1 if m.group(1).startswith('-') else 1
+        deg = abs(float(re.sub(r'[+\-]', '', m.group(1))))
+        arcmin = float(m.group(2))
+        return sgn * (deg + arcmin/60.0)
+    
     return None
 
-
 def detect_obs_code_in_line(line: str, obs_map: Dict[str, Tuple[float, float, float, str]]) -> Optional[str]:
-    """
-    Попытка найти код обсерватории как отдельный токен (из списка obs_map).
-    Возвращает код в верхнем регистре или None.
-    """
-    tokens = re.split(r'\s+', line.strip())
-    for tok in reversed(tokens):
-        clean = re.sub(r'[^0-9A-Z]', '', tok.upper())
-        if clean in obs_map:
-            return clean
-    # fallback: искать подстроки
-    for code in obs_map.keys():
-        if code in line:
+    """ Ищет код обсерватории."""
+    if not line:
+        return None
+
+    # Удаляем пробелы в начале и конце
+    trimmed = line.strip()
+    
+    # Разбиваем строку на части по пробелам
+    parts = trimmed.split()
+    
+    if not parts:
+        return None
+    
+    # Последняя часть - это ссылка (например, "HD016024")
+    last_part = parts[-1]
+    
+    # Ищем 3 цифры в конце последней части
+    # Это может быть код обсерватории
+    match = re.search(r'(\d{3})$', last_part)
+    if match:
+        code = match.group(1)
+        if code in obs_map:
             return code
+    
+    # Если не нашли 3 цифры, пробуем весь последний токен
+    if last_part in obs_map:
+        return last_part
+    
+    # Или предпоследний токен (на случай, если код отдельно)
+    if len(parts) >= 2:
+        prev_part = parts[-2]
+        if prev_part in obs_map:
+            return prev_part
+    
     return None
 
 
 def find_obs_code_fallback_from_token(token: str, obs_map: Dict[str, Tuple[float, float, float, str]]) -> Optional[str]:
-    """Пытаемся извлечь 3-символьную подстроку из токена, совпадающую с ключом obs_map."""
-    clean = re.sub(r'[^0-9A-Z]', '', token.upper())
-    n = len(clean)
-    for i in range(max(0, n - 3 + 1)):
-        sub = clean[i:i + 3]
-        if len(sub) == 3 and sub in obs_map:
-            return sub
-    if n >= 3:
-        tail = clean[-3:]
-        if tail in obs_map:
-            return tail
+    """ Ищет код обсерватории как последние 3 символа предоставленного токена."""
+    if not token:
+        return None
+
+    tok = token.strip()
+    if len(tok) < 3:
+        return None
+
+    last_three = tok[-3:]
+    if last_three in obs_map:
+        return last_three
+
     return None
-
-
-def cylindrical_to_cartesian_km(lon_deg: float, r_radii: float, z_radii: float) -> Tuple[float, float, float]:
-    """
-    λ (deg), r (земные радиусы), z (земные радиусы) -> X,Y,Z в км.
-    Преобразует цилиндрические координаты обсерватории в декартовы
-    """
-    lon_rad = math.radians(lon_deg)
-    r_km = r_radii * EARTH_EQUATORIAL_RADIUS_KM
-    z_km = z_radii * EARTH_EQUATORIAL_RADIUS_KM
-    x = r_km * math.cos(lon_rad)
-    y = r_km * math.sin(lon_rad)
-    z = z_km
-    return x, y, z
-
-
-def compute_dtr_ephemeris(t_tt):
-    """
-    Вычисление точной разницы TT-TDB (в секундах) через эфемериды.
-    
-    Использует астрономические модели для вычисления dtr = TT - TDB.
-    Более точная альтернатива аналитической модели.
-    """
-    # Создаем время в шкале TT
-    tt_time = Time(t_tt.jd, format='jd', scale='tt')
-        
-    # Преобразуем в TDB 
-    tdb_time = tt_time.tdb
-        
-    # Разница в секундах: dtr = TT - TDB
-    dtr_seconds = (tt_time.jd - tdb_time.jd) * 86400.0
-        
-    return dtr_seconds
 
 
 def parse_observations_file_improved(path: str, obs_map: Dict[str, Tuple[float, float, float, str]]):
     """
-    Основной парсер:
-    - находит date/RA/Dec или alt-vector
-    - пытается распознать obs_code
-    - сохраняет флаги и возвращает DataFrame + список bad_lines
+    Основной парсер - ищет код обсерватории как последние 3 символа строки.
     """
     records = []
     bad_lines = []
-    counters = {"lines_total": 0, "date_found": 0, "ra_found": 0, "dec_found": 0, "alt_vector": 0, "obs_found": 0}
+    counters = {"lines_total": 0, "date_found": 0, "ra_found": 0, "dec_found": 0, "obs_found": 0}
 
     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
@@ -240,86 +291,58 @@ def parse_observations_file_improved(path: str, obs_map: Dict[str, Tuple[float, 
         if not L.strip():
             continue
         counters["lines_total"] += 1
+        
         try:
             t_utc = parse_time_from_line(L)
-            # Ищет паттерн: "2023 10 15.92734"
-            # преобразует в "2023-10-15T22:15:22.333"
             if t_utc is not None:
                 counters["date_found"] += 1
 
             ra_deg = parse_ra_from_line(L)
-            # "123456.7" превращает в 12ч 34м 56.7с
-            # Конвертация: (12 + 34/60 + 56.7/3600) × 15 = 188.73625°
             if ra_deg is not None:
                 counters["ra_found"] += 1
 
             dec_deg = parse_dec_from_line(L)
-            # "+451234.5" в  +45° 12' 34.5"
-            # Конвертация: 45 + 12/60 + 34.5/3600 = 45.209583°
             if dec_deg is not None:
                 counters["dec_found"] += 1
 
-            alt_x = alt_y = alt_z = None
-            mvec = vector_re.search(L)
-            # Иногда вместо RA/Dec могут быть геоцентрические координаты
-            if mvec:
-                try:
-                    # + 3440.2430  + 1889.8250  + 4667.1340
-                    def norm_num(s): return float(s.replace(' ', ''))
-                    alt_x = norm_num(mvec.group(1)); alt_y = norm_num(mvec.group(2)); alt_z = norm_num(mvec.group(3))
-                    counters["alt_vector"] += 1
-                except Exception:
-                    alt_x = alt_y = alt_z = None
-
-            # если нет даты — ошибкв
             if t_utc is None:
                 bad_lines.append(L.strip() + "  <-- date not found")
                 continue
 
-            # если нет ни RA/Dec, ни alt-vector — ошибка
-            if ra_deg is None and dec_deg is None and alt_x is None:
-                bad_lines.append(L.strip() + "  <-- RA/Dec and alt-vector not found")
+            if ra_deg is None or dec_deg is None:
+                bad_lines.append(L.strip() + "  <-- RA/Dec not found")
                 continue
 
-            # попытка найти obs_code
+            # Ищем код обсерватории как последние 3 символа строки
             obs_code = detect_obs_code_in_line(L, obs_map=obs_map)
+            
             if obs_code is None:
+                # Фолбэк: ищем в последнем токене
                 last_tok = re.split(r'\s+', L.strip())[-1]
                 obs_code = find_obs_code_fallback_from_token(last_tok, obs_map)
+                
             if obs_code is not None:
                 counters["obs_found"] += 1
 
             if obs_code is None:
-                bad_lines.append(L.strip() + "  <-- obs code NOT found; record saved with obs_code=None")
+                bad_lines.append(L.strip() + "  <-- obs code NOT found")
+                continue
 
-            if obs_code is not None:
-                lon_deg, r_radii, z_radii, obs_name = obs_map[obs_code]
-                obs_x_km, obs_y_km, obs_z_km = cylindrical_to_cartesian_km(lon_deg, r_radii, z_radii)
-            else:
-                lon_deg = r_radii = z_radii = None
-                obs_name = None
-                obs_x_km = obs_y_km = obs_z_km = None
-
-            t_tt = t_utc.tt
+            lon_deg, cos_phi, sin_phi, obs_name = obs_map[obs_code]
+            obs_pos = obs2cart(t_utc, lon_deg, cos_phi, sin_phi)
+            obs_x, obs_y, obs_z = obs_pos[0], obs_pos[1], obs_pos[2]
             t_tdb = t_utc.tdb
             
-            dtr_sec = compute_dtr_ephemeris(t_tt)
-            
             rec = {
-                "time_utc_iso": t_utc.iso,
-                "time_tt_iso": t_tt.iso,
-                "time_tdb_iso": t_tdb.iso,
-                "dtr_sec": dtr_sec, 
+                "time_utc": t_utc,
+                "time_tdb": t_tdb,
                 "ra_deg": ra_deg,
                 "dec_deg": dec_deg,
-                "alt_x_raw": alt_x,
-                "alt_y_raw": alt_y,
-                "alt_z_raw": alt_z,
+                "obs_x": obs_x,
+                "obs_y": obs_y,
+                "obs_z": obs_z,
                 "obs_code": obs_code,
-                "obs_name": obs_name,
-                "obs_x_km": obs_x_km,
-                "obs_y_km": obs_y_km,
-                "obs_z_km": obs_z_km
+                "obs_name": obs_name
             }
             records.append(rec)
 
@@ -331,31 +354,115 @@ def parse_observations_file_improved(path: str, obs_map: Dict[str, Tuple[float, 
     print("=== PARSER DIAGNOSTICS ===")
     for k, v in counters.items():
         print(f"{k}: {v}")
+    print(f"Успешно распознано записей: {len(df)}")
+    print(f"Ошибочных строк: {len(bad_lines)}")
     print("==========================")
     return df, bad_lines
 
 
-def main(infile: str, outfile_csv: str = "all_observations.csv", badfile: str = "bad_lines.txt"):
-    print("Загрузка таблицы observatory codes (ObsCodesF) ...")
-    html = fetch_obs_codes_html()
-    obs_map = parse_obs_codes_from_html(html)
-    print(f"Загружено кодов обсерваторий: {len(obs_map)}")
+def convert_date_format(date_str: str) -> str:
+    """
+    Конвертирует дату из формата DD-MM-YYYY в YYYY-MM-DD
+    """
+    try:
+        day, month, year = date_str.split('-')
+        return f"{year}-{month}-{day}"
+    except Exception as e:
+        print(f"Ошибка при конвертации даты '{date_str}': {e}")
+        raise ValueError(f"Неверный формат даты: {date_str}. Ожидается DD-MM-YYYY")
+
+def filter_by_date_range(df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
+    try:
+        # Конвертируем даты из DD-MM-YYYY в YYYY-MM-DD
+        start_date_iso = convert_date_format(start_date)
+        end_date_iso = convert_date_format(end_date)
+        
+        # Преобразуем строки в объекты Time в UTC
+        start_time_utc = Time(f"{start_date_iso}T00:00:00", format='isot', scale='utc')
+        end_time_utc = Time(f"{end_date_iso}T23:59:59.999", format='isot', scale='utc')
+        
+        print(f"Фильтрация данных по периоду в UTC: {start_date} - {end_date}")
+        print(f"Начальное время (UTC): {start_time_utc.iso}")
+        print(f"Конечное время (UTC): {end_time_utc.iso}")
+        
+        # Фильтруем данные по UTC времени
+        mask = (df['time_utc'] >= start_time_utc) & (df['time_utc'] <= end_time_utc)
+        filtered_df = df[mask].copy()
+        
+        print(f"Записей до фильтрации: {len(df)}")
+        print(f"Записей после фильтрации: {len(filtered_df)}")
+        
+        if filtered_df.empty:
+            print("ВНИМАНИЕ: После фильтрации не осталось данных!")
+        
+        return filtered_df
+    
+    except Exception as e:
+        print(f"Ошибка при фильтрации по дате: {e}")
+        return df
+
+
+def write_output_table(df: pd.DataFrame, output_file: str = "output.txt"):
+    """
+    Формат:
+    utc_jd tdb_jd ra_deg dec_deg obs_x obs_y obs_z
+    """
+    if df.empty:
+        print("Нет данных для записи")
+        return
+
+    df = df.sort_values("time_utc")
+
+    with open(output_file, 'w') as f:
+        for _, row in df.iterrows():
+            utc_jd = row["time_utc"].jd
+            tdb_jd = row["time_tdb"].jd
+
+            f.write(
+                f"{utc_jd:.10f} "
+                f"{tdb_jd:.10f} "
+                f"{row['ra_deg']:.10f} "
+                f"{row['dec_deg']:.10f} "
+                f"{row['obs_x']:.10f} "
+                f"{row['obs_y']:.10f} "
+                f"{row['obs_z']:.10f}\n"
+            )
+
+    print(f"Данные успешно сохранены в {output_file}")
+    print(f"Всего записей в файле: {len(df)}")
+
+
+
+def main(infile: str, outfile: str = "output.txt", badfile: str = "bad_lines.txt"):
+    print("Чтение таблицы observatory codes из файла obscodes.txt...")
+    try:
+        obs_map = read_observatories_from_file()
+    except Exception as e:
+        print(f"КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        sys.exit(1)
 
     print("Парсинг входного файла...")
     df, bad = parse_observations_file_improved(infile, obs_map)
-    print(f"Успешно распознано записей: {len(df)}. Ошибочных строк: {len(bad)}")
-
-    df.to_csv(outfile_csv, index=False)
-    with open(badfile, 'w', encoding='utf-8') as f:
-        for L in bad:
-            f.write(L.rstrip() + "\n")
-    print(f"Сохранено: {outfile_csv}; Ошибки в {badfile}")
+    
+    if not df.empty:
+        df_filtered = filter_by_date_range(df, "30-09-2022", "7-10-2022")
+        
+        if not df_filtered.empty:
+            write_output_table(df_filtered, outfile)
+        else:
+            print("Нет данных в указанном временном периоде для записи в файл")
+    
+    if bad:
+        with open(badfile, 'w', encoding='utf-8') as f:
+            for L in bad:
+                f.write(L.rstrip() + "\n")
+        print(f"Ошибки сохранены в {badfile}")
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Использование: python prepare_obs.py <input_file> [output_csv]")
+        print("Использование: python prepare_obs.py <input_file> [output_file]")
         sys.exit(1)
     infile = sys.argv[1]
-    outfile = sys.argv[2] if len(sys.argv) >= 3 else "all_observations.csv"
+    outfile = sys.argv[2] if len(sys.argv) >= 3 else "output.txt"
     main(infile, outfile)
